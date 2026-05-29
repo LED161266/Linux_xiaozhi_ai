@@ -1,0 +1,29 @@
+# Build
+build/
+out/
+dist/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Binary
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.a
+
+# Logs
+logs/
+*.log
+
+# VSCode
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
