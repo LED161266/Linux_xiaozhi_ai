@@ -22,7 +22,23 @@ project(xiaozhi_http C)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-if(TARGET_PLATFORM STREQUAL "rk3568")
+set(USE_RK3568_SYSROOT OFF)
+if(DEFINED RK3568_SYSROOT AND RK3568_SYSROOT)
+    set(USE_RK3568_SYSROOT ON)
+elseif(DEFINED ENV{RK3568_SYSROOT} AND NOT "$ENV{RK3568_SYSROOT}" STREQUAL "")
+    set(RK3568_SYSROOT "$ENV{RK3568_SYSROOT}" CACHE PATH "RK3568 sysroot")
+    set(USE_RK3568_SYSROOT ON)
+elseif(CMAKE_FIND_ROOT_PATH MATCHES "rk3568-sysroot")
+    foreach(ROOT_PATH IN LISTS CMAKE_FIND_ROOT_PATH)
+        if(ROOT_PATH MATCHES "rk3568-sysroot")
+            set(RK3568_SYSROOT "${ROOT_PATH}" CACHE PATH "RK3568 sysroot")
+            set(USE_RK3568_SYSROOT ON)
+            break()
+        endif()
+    endforeach()
+endif()
+
+if(TARGET_PLATFORM STREQUAL "rk3568" OR USE_RK3568_SYSROOT)
     set(DEFAULT_CURL_ROOT "")
     set(DEFAULT_OPENSSL_ROOT "")
     set(DEFAULT_OPUS_ROOT "")
@@ -41,6 +57,63 @@ else()
 endif()
 
 # 指定自定义 libcurl 路径
+set(RK3568_INCLUDE_DIRS "")
+if(USE_RK3568_SYSROOT)
+    set(RK3568_INCLUDE_DIRS
+        "${RK3568_SYSROOT}/usr/include"
+        "${RK3568_SYSROOT}/usr/include/aarch64-linux-gnu"
+    )
+    set(RK3568_LIBRARY_DIRS
+        "${RK3568_SYSROOT}/lib/aarch64-linux-gnu"
+        "${RK3568_SYSROOT}/usr/lib/aarch64-linux-gnu"
+    )
+
+    find_path(CURL_INCLUDE_DIR NAMES curl/curl.h PATHS ${RK3568_INCLUDE_DIRS} NO_DEFAULT_PATH)
+    find_library(CURL_LIBRARY NAMES curl PATHS ${RK3568_LIBRARY_DIRS} NO_DEFAULT_PATH)
+
+    find_path(OPENSSL_INCLUDE_DIR NAMES openssl/ssl.h PATHS ${RK3568_INCLUDE_DIRS} NO_DEFAULT_PATH)
+    find_library(OPENSSL_SSL_LIBRARY NAMES ssl PATHS ${RK3568_LIBRARY_DIRS} NO_DEFAULT_PATH)
+    find_library(OPENSSL_CRYPTO_LIBRARY NAMES crypto PATHS ${RK3568_LIBRARY_DIRS} NO_DEFAULT_PATH)
+
+    find_path(OPUS_INCLUDE_DIR NAMES opus/opus.h PATHS ${RK3568_INCLUDE_DIRS} NO_DEFAULT_PATH)
+    find_library(OPUS_LIB NAMES opus PATHS ${RK3568_LIBRARY_DIRS} NO_DEFAULT_PATH)
+
+    find_path(ALSA_INCLUDE_DIR NAMES alsa/asoundlib.h PATHS ${RK3568_INCLUDE_DIRS} NO_DEFAULT_PATH)
+    find_library(ALSA_LIB NAMES asound PATHS ${RK3568_LIBRARY_DIRS} NO_DEFAULT_PATH)
+
+    find_path(LIBWEBSOCKETS_INCLUDE_DIR NAMES libwebsockets.h PATHS ${RK3568_INCLUDE_DIRS} NO_DEFAULT_PATH)
+    find_library(WEBSOCKETS_LIB NAMES websockets PATHS ${RK3568_LIBRARY_DIRS} NO_DEFAULT_PATH)
+
+    find_path(CJSON_INCLUDE_DIR NAMES cjson/cJSON.h cJSON.h PATHS ${RK3568_INCLUDE_DIRS} NO_DEFAULT_PATH)
+    find_library(CJSON_LIB NAMES cjson PATHS ${RK3568_LIBRARY_DIRS} NO_DEFAULT_PATH)
+
+    find_library(ZLIB_LIB NAMES z PATHS ${RK3568_LIBRARY_DIRS} NO_DEFAULT_PATH)
+    file(GLOB RK3568_ZLIB_CANDIDATES
+        "${RK3568_SYSROOT}/lib/aarch64-linux-gnu/libz.so.*"
+        "${RK3568_SYSROOT}/usr/lib/aarch64-linux-gnu/libz.so.*"
+    )
+    foreach(RK3568_ZLIB_CANDIDATE IN LISTS RK3568_ZLIB_CANDIDATES)
+        if(EXISTS "${RK3568_ZLIB_CANDIDATE}" AND NOT IS_SYMLINK "${RK3568_ZLIB_CANDIDATE}")
+            set(ZLIB_LIB "${RK3568_ZLIB_CANDIDATE}")
+            break()
+        endif()
+    endforeach()
+
+    foreach(REQUIRED_LIB
+        CURL_INCLUDE_DIR CURL_LIBRARY
+        OPENSSL_INCLUDE_DIR OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY
+        OPUS_INCLUDE_DIR OPUS_LIB
+        ALSA_INCLUDE_DIR ALSA_LIB
+        LIBWEBSOCKETS_INCLUDE_DIR WEBSOCKETS_LIB
+        CJSON_INCLUDE_DIR CJSON_LIB
+        ZLIB_LIB
+    )
+        if(NOT DEFINED ${REQUIRED_LIB} OR "${${REQUIRED_LIB}}" STREQUAL "" OR "${${REQUIRED_LIB}}" MATCHES "-NOTFOUND$")
+            message(FATAL_ERROR "RK3568 dependency ${REQUIRED_LIB} not found in ${RK3568_SYSROOT}")
+        endif()
+    endforeach()
+else()
+
 set(CURL_ROOT "${DEFAULT_CURL_ROOT}" CACHE PATH "curl install root")
 if(CURL_ROOT)
     set(CURL_INCLUDE_DIR "${CURL_ROOT}/include")
@@ -112,6 +185,7 @@ else()
     find_library(CJSON_LIB cjson)
 endif()
 # 设置可执行文件输出目录
+endif()
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 # 添加可执行文件
@@ -128,6 +202,7 @@ else()
 endif()
 # 包含头文件路径
 target_include_directories(xiaozhi_http PRIVATE 
+    ${RK3568_INCLUDE_DIRS}
     ${CURL_INCLUDE_DIR}
     ${OPENSSL_INCLUDE_DIR}
     ${OPUS_INCLUDE_DIR}
@@ -136,6 +211,7 @@ target_include_directories(xiaozhi_http PRIVATE
 
 # websocket_test 包含头文件路径
 target_include_directories(websocket_test PRIVATE 
+    ${RK3568_INCLUDE_DIRS}
     ${LIBWEBSOCKETS_INCLUDE_DIR}
     ${OPENSSL_INCLUDE_DIR}
     ${CJSON_INCLUDE_DIR}
@@ -143,6 +219,7 @@ target_include_directories(websocket_test PRIVATE
 
 if(TARGET websocket)
     target_include_directories(websocket PRIVATE
+        ${RK3568_INCLUDE_DIRS}
         ${LIBWEBSOCKETS_INCLUDE_DIR}
         ${OPENSSL_INCLUDE_DIR}
         ${CJSON_INCLUDE_DIR}
@@ -206,16 +283,18 @@ if(TARGET websocket)
 endif()
 
 # 添加库搜索路径（CMake 3.10 兼容方式）
-set_target_properties(websocket_test PROPERTIES
-    LINK_FLAGS "-L${OPENSSL_ROOT}/lib -L${LIBWEBSOCKETS_LIB_DIR} -L${ZLIB_LIB_DIR}"
-    LINK_FLAGS "-L${OPENSSL_ROOT}/lib -L${LIBWEBSOCKETS_LIB_DIR} -L${ZLIB_LIB_DIR} -L${CJSON_LIB_DIR}"
-)
-
-if(TARGET websocket)
-    set_target_properties(websocket PROPERTIES
+if(NOT USE_RK3568_SYSROOT)
+    set_target_properties(websocket_test PROPERTIES
         LINK_FLAGS "-L${OPENSSL_ROOT}/lib -L${LIBWEBSOCKETS_LIB_DIR} -L${ZLIB_LIB_DIR}"
         LINK_FLAGS "-L${OPENSSL_ROOT}/lib -L${LIBWEBSOCKETS_LIB_DIR} -L${ZLIB_LIB_DIR} -L${CJSON_LIB_DIR}"
     )
+
+    if(TARGET websocket)
+        set_target_properties(websocket PROPERTIES
+            LINK_FLAGS "-L${OPENSSL_ROOT}/lib -L${LIBWEBSOCKETS_LIB_DIR} -L${ZLIB_LIB_DIR}"
+            LINK_FLAGS "-L${OPENSSL_ROOT}/lib -L${LIBWEBSOCKETS_LIB_DIR} -L${ZLIB_LIB_DIR} -L${CJSON_LIB_DIR}"
+        )
+    endif()
 endif()
 
 # 设置编译选项
