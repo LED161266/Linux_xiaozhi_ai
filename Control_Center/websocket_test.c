@@ -84,6 +84,7 @@ static unsigned long g_audio_tx_dropped_count = 0;
 static unsigned long g_ws_audio_sent_count = 0;
 static unsigned long g_server_binary_recv_count = 0;
 static unsigned long g_udp_forward_sent_count = 0;
+static unsigned long g_udp_forward_send_fail_count = 0;
 
 static pthread_mutex_t g_ws_text_mutex = PTHREAD_MUTEX_INITIALIZER;
 static ws_text_packet_t g_ws_text_queue[WS_TEXT_QUEUE_DEPTH];
@@ -92,6 +93,7 @@ static size_t g_ws_text_tail = 0;
 static size_t g_ws_text_count = 0;
 static unsigned long g_ws_text_dropped_count = 0;
 static unsigned long g_ws_text_sent_count = 0;
+static unsigned long g_listen_stop_sent_count = 0;
 
 /* 连接参数 */
 struct connection_params {
@@ -121,6 +123,7 @@ static int audio_tx_dequeue(unsigned char *data, size_t *len);
 static size_t audio_tx_pending_count(void);
 static void audio_tx_clear(void);
 static void request_ws_audio_write(void);
+static void PrintAudioStats(const char *tag);
 static void LogProtocolState(const char *tag);
 static int ws_text_enqueue_ex(const char *data, size_t len, ws_text_kind_t kind, const char *reason);
 static int ws_text_dequeue(char *data, size_t *len, ws_text_kind_t *kind, char *reason, size_t reason_size);
@@ -175,7 +178,7 @@ static int audio_tx_enqueue(const unsigned char *data, size_t len)
     pthread_mutex_unlock(&g_audio_tx_mutex);
 
     if (recv_snapshot <= 5 || (recv_snapshot % AUDIO_LOG_INTERVAL) == 0 ||
-        (dropped_snapshot > 0 && (dropped_snapshot <= 5 || (dropped_snapshot % 100) == 0))) {
+        (dropped_snapshot > 0 && (dropped_snapshot <= 5 || (dropped_snapshot % 1000) == 0))) {
         printf("[audio] udp_recv=%lu queued=%lu dropped=%lu pending=%zu last_len=%zu\n",
                recv_snapshot, enqueued_snapshot, dropped_snapshot, pending_snapshot, len);
     }
@@ -223,6 +226,38 @@ static void audio_tx_clear(void)
     g_audio_tx_tail = 0;
     g_audio_tx_count = 0;
     pthread_mutex_unlock(&g_audio_tx_mutex);
+}
+
+static void PrintAudioStats(const char *tag)
+{
+    unsigned long udp_recv = 0;
+    unsigned long queued = 0;
+    unsigned long dropped = 0;
+    size_t pending = 0;
+
+    pthread_mutex_lock(&g_audio_tx_mutex);
+    udp_recv = g_udp_audio_recv_count;
+    queued = g_audio_tx_enqueued_count;
+    dropped = g_audio_tx_dropped_count;
+    pending = g_audio_tx_count;
+    pthread_mutex_unlock(&g_audio_tx_mutex);
+
+    printf("[stats] %s udp9001_recv=%lu ws_binary_sent=%lu audio_queue_queued=%lu audio_queue_dropped=%lu audio_queue_pending=%zu server_binary_recv=%lu udp9002_sent=%lu udp9002_send_failed=%lu listen_start_sent=%lu listen_stop_sent=%lu listen_mode=%s stop_after_sec=%d ws_text_sent=%lu ws_text_dropped=%lu\n",
+           tag != NULL ? tag : "final",
+           udp_recv,
+           g_ws_audio_sent_count,
+           queued,
+           dropped,
+           pending,
+           g_server_binary_recv_count,
+           g_udp_forward_sent_count,
+           g_udp_forward_send_fail_count,
+           g_listen_start_sent_count,
+           g_listen_stop_sent_count,
+           g_listen_mode,
+           g_listen_stop_after_sec,
+           g_ws_text_sent_count,
+           g_ws_text_dropped_count);
 }
 
 static void LogProtocolState(const char *tag)
@@ -661,13 +696,18 @@ static void ProcessBinDataFrmServer(unsigned char *data, size_t len)
                               (struct sockaddr *)&g_udp_forward_addr, 
                               sizeof(g_udp_forward_addr));
         if (sent < 0) {
+            g_udp_forward_send_fail_count++;
             perror("❌ UDP 转发失败");
         } else {
             g_udp_forward_sent_count++;
-            if (g_server_binary_recv_count <= 5 ||
+            if (g_server_binary_recv_count == 1 ||
+                g_server_binary_recv_count == 10 ||
+                g_server_binary_recv_count == 50 ||
+                g_server_binary_recv_count == 100 ||
                 (g_server_binary_recv_count % AUDIO_LOG_INTERVAL) == 0) {
-                printf("[audio] server_binary_recv=%lu len=%zu udp9002_sent=%lu sent_len=%zd\n",
-                       g_server_binary_recv_count, len, g_udp_forward_sent_count, sent);
+                printf("[audio] server_binary_recv=%lu len=%zu udp9002_sent=%lu udp9002_failed=%lu sent_len=%zd\n",
+                       g_server_binary_recv_count, len, g_udp_forward_sent_count,
+                       g_udp_forward_send_fail_count, sent);
             }
         }
     }
@@ -989,6 +1029,7 @@ static int callback_echo(struct lws *wsi, enum lws_callback_reasons reason,
         g_after_tools_list_listen_sent_time = 0;
         g_listen_stop_queued = 0;
         g_listen_stop_sent = 0;
+        g_listen_stop_sent_count = 0;
         g_mcp_initialize_replied = 0;
         g_mcp_initialized_notification_recv = 0;
         g_mcp_tools_list_replied = 0;
@@ -1070,6 +1111,7 @@ static int callback_echo(struct lws *wsi, enum lws_callback_reasons reason,
                 LogProtocolState("listen_start_sent");
             } else if (text_kind == WS_TEXT_KIND_LISTEN_STOP) {
                 g_listen_stop_sent = 1;
+                g_listen_stop_sent_count++;
                 printf("[listen] sent stop reason=%s ret=%d/%zu\n",
                        text_reason[0] != '\0' ? text_reason : "unknown", n, text_len);
                 LogProtocolState("listen_stop_sent");
@@ -1238,6 +1280,7 @@ int main(void) {
     if (g_audio_thread_running) {
         stop_audio_thread();
     }
+    PrintAudioStats("final");
     
     g_lws_context = NULL;
     lws_context_destroy(context);
