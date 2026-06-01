@@ -20,6 +20,8 @@
 #define UDP_AUDIO_MAX_SIZE  4096
 #define AUDIO_TX_QUEUE_DEPTH 64
 #define AUDIO_LOG_INTERVAL  500
+#define WS_TEXT_MAX_SIZE    4096
+#define WS_TEXT_QUEUE_DEPTH 8
 #define DEFAULT_PROTOCOL    "xiaozhi-protocol"
 
 /* ==================== 全局变量 ==================== */
@@ -44,6 +46,11 @@ typedef struct {
     unsigned char data[UDP_AUDIO_MAX_SIZE];
 } audio_tx_packet_t;
 
+typedef struct {
+    size_t len;
+    char data[WS_TEXT_MAX_SIZE];
+} ws_text_packet_t;
+
 static pthread_mutex_t g_audio_tx_mutex = PTHREAD_MUTEX_INITIALIZER;
 static audio_tx_packet_t g_audio_tx_queue[AUDIO_TX_QUEUE_DEPTH];
 static size_t g_audio_tx_head = 0;
@@ -55,6 +62,14 @@ static unsigned long g_audio_tx_dropped_count = 0;
 static unsigned long g_ws_audio_sent_count = 0;
 static unsigned long g_server_binary_recv_count = 0;
 static unsigned long g_udp_forward_sent_count = 0;
+
+static pthread_mutex_t g_ws_text_mutex = PTHREAD_MUTEX_INITIALIZER;
+static ws_text_packet_t g_ws_text_queue[WS_TEXT_QUEUE_DEPTH];
+static size_t g_ws_text_head = 0;
+static size_t g_ws_text_tail = 0;
+static size_t g_ws_text_count = 0;
+static unsigned long g_ws_text_dropped_count = 0;
+static unsigned long g_ws_text_sent_count = 0;
 
 /* 连接参数 */
 struct connection_params {
@@ -84,10 +99,17 @@ static int audio_tx_dequeue(unsigned char *data, size_t *len);
 static size_t audio_tx_pending_count(void);
 static void audio_tx_clear(void);
 static void request_ws_audio_write(void);
+static int ws_text_enqueue(const char *data, size_t len);
+static int ws_text_dequeue(char *data, size_t *len);
+static size_t ws_text_pending_count(void);
+static void ws_text_clear(void);
+static void request_ws_text_write(void);
 static void StartListen(struct lws *wsi);
 static void ProcessBinDataFrmServer(unsigned char *data, size_t len);
 static void ProcessTxtDataFrmServer(const char *data, size_t len);
 static void ProcessHello(cJSON *root);
+static void ProcessMCP(cJSON *root);
+static void SendMCPInitializeResult(cJSON *request_id, const char *protocol_version);
 static void ProcessTTS(cJSON *root);
 static void ProcessSTT(cJSON *root);
 
@@ -176,6 +198,76 @@ static void audio_tx_clear(void)
     pthread_mutex_unlock(&g_audio_tx_mutex);
 }
 
+static int ws_text_enqueue(const char *data, size_t len)
+{
+    if (data == NULL || len == 0 || len >= WS_TEXT_MAX_SIZE) {
+        printf("[ws-text] warning: skip invalid text frame len=%zu\n", len);
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_ws_text_mutex);
+
+    if (g_ws_text_count == WS_TEXT_QUEUE_DEPTH) {
+        g_ws_text_head = (g_ws_text_head + 1) % WS_TEXT_QUEUE_DEPTH;
+        g_ws_text_count--;
+        g_ws_text_dropped_count++;
+        printf("[ws-text] warning: text queue full, dropped oldest count=%lu\n",
+               g_ws_text_dropped_count);
+    }
+
+    g_ws_text_queue[g_ws_text_tail].len = len;
+    memcpy(g_ws_text_queue[g_ws_text_tail].data, data, len);
+    g_ws_text_queue[g_ws_text_tail].data[len] = '\0';
+    g_ws_text_tail = (g_ws_text_tail + 1) % WS_TEXT_QUEUE_DEPTH;
+    g_ws_text_count++;
+
+    pthread_mutex_unlock(&g_ws_text_mutex);
+    return 1;
+}
+
+static int ws_text_dequeue(char *data, size_t *len)
+{
+    if (data == NULL || len == NULL) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_ws_text_mutex);
+
+    if (g_ws_text_count == 0) {
+        pthread_mutex_unlock(&g_ws_text_mutex);
+        return 0;
+    }
+
+    *len = g_ws_text_queue[g_ws_text_head].len;
+    memcpy(data, g_ws_text_queue[g_ws_text_head].data, *len);
+    data[*len] = '\0';
+    g_ws_text_head = (g_ws_text_head + 1) % WS_TEXT_QUEUE_DEPTH;
+    g_ws_text_count--;
+
+    pthread_mutex_unlock(&g_ws_text_mutex);
+    return 1;
+}
+
+static size_t ws_text_pending_count(void)
+{
+    size_t pending = 0;
+
+    pthread_mutex_lock(&g_ws_text_mutex);
+    pending = g_ws_text_count;
+    pthread_mutex_unlock(&g_ws_text_mutex);
+
+    return pending;
+}
+
+static void ws_text_clear(void)
+{
+    pthread_mutex_lock(&g_ws_text_mutex);
+    g_ws_text_head = 0;
+    g_ws_text_tail = 0;
+    g_ws_text_count = 0;
+    pthread_mutex_unlock(&g_ws_text_mutex);
+}
+
 static void request_ws_audio_write(void)
 {
     struct lws *wsi = client_wsi;
@@ -187,6 +279,11 @@ static void request_ws_audio_write(void)
     if (g_lws_context != NULL) {
         lws_cancel_service(g_lws_context);
     }
+}
+
+static void request_ws_text_write(void)
+{
+    request_ws_audio_write();
 }
 
 /* ==================== UDP 转发初始化 ==================== */
@@ -450,6 +547,8 @@ static void ProcessTxtDataFrmServer(const char *data, size_t len)
     
     if (strcmp(msg_type, "hello") == 0) {
         ProcessHello(root);
+    } else if (strcmp(msg_type, "mcp") == 0) {
+        ProcessMCP(root);
     } else if (strcmp(msg_type, "tts") == 0) {
         ProcessTTS(root);
     } else if (strcmp(msg_type, "stt") == 0) {
@@ -484,6 +583,118 @@ static void ProcessHello(cJSON *root)
     if (client_wsi) {
         StartListen(client_wsi);
     }
+}
+
+/* ==================== MCP 消息处理 ==================== */
+static void ProcessMCP(cJSON *root)
+{
+    cJSON *payload = cJSON_GetObjectItemCaseSensitive(root, "payload");
+    if (!cJSON_IsObject(payload)) {
+        printf("[mcp] warning: mcp message has no payload object\n");
+        return;
+    }
+
+    cJSON *method = cJSON_GetObjectItemCaseSensitive(payload, "method");
+    cJSON *id = cJSON_GetObjectItemCaseSensitive(payload, "id");
+    cJSON *params = cJSON_GetObjectItemCaseSensitive(payload, "params");
+    cJSON *protocol_version = NULL;
+    const char *protocol_version_text = "2024-11-05";
+
+    char *payload_text = cJSON_PrintUnformatted(payload);
+    if (payload_text != NULL) {
+        printf("[mcp] payload=%s\n", payload_text);
+        free(payload_text);
+    }
+
+    if (!cJSON_IsString(method) || method->valuestring == NULL) {
+        printf("[mcp] warning: missing method\n");
+        return;
+    }
+
+    if (cJSON_IsObject(params)) {
+        protocol_version = cJSON_GetObjectItemCaseSensitive(params, "protocolVersion");
+        if (cJSON_IsString(protocol_version) && protocol_version->valuestring != NULL &&
+            protocol_version->valuestring[0] != '\0') {
+            protocol_version_text = protocol_version->valuestring;
+        }
+    }
+
+    if (cJSON_IsNumber(id)) {
+        printf("[mcp] method=%s id=%g protocolVersion=%s\n",
+               method->valuestring, id->valuedouble, protocol_version_text);
+    } else if (cJSON_IsString(id) && id->valuestring != NULL) {
+        printf("[mcp] method=%s id=%s protocolVersion=%s\n",
+               method->valuestring, id->valuestring, protocol_version_text);
+    } else {
+        printf("[mcp] method=%s id=<missing> protocolVersion=%s\n",
+               method->valuestring, protocol_version_text);
+    }
+
+    if (strcmp(method->valuestring, "initialize") == 0) {
+        printf("[mcp] received initialize request\n");
+        SendMCPInitializeResult(id, protocol_version_text);
+    }
+}
+
+static void SendMCPInitializeResult(cJSON *request_id, const char *protocol_version)
+{
+    if (request_id == NULL || (!cJSON_IsNumber(request_id) && !cJSON_IsString(request_id))) {
+        printf("[mcp] warning: skip initialize result because request id is missing\n");
+        return;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *payload = cJSON_CreateObject();
+    cJSON *result = cJSON_CreateObject();
+    cJSON *capabilities = cJSON_CreateObject();
+    cJSON *client_info = cJSON_CreateObject();
+    cJSON *id_copy = cJSON_Duplicate(request_id, 1);
+
+    if (root == NULL || payload == NULL || result == NULL ||
+        capabilities == NULL || client_info == NULL || id_copy == NULL) {
+        printf("[mcp] error: failed to allocate initialize result JSON\n");
+        cJSON_Delete(root);
+        cJSON_Delete(payload);
+        cJSON_Delete(result);
+        cJSON_Delete(capabilities);
+        cJSON_Delete(client_info);
+        cJSON_Delete(id_copy);
+        return;
+    }
+
+    if (g_session_id[0] != '\0') {
+        cJSON_AddStringToObject(root, "session_id", g_session_id);
+    }
+    cJSON_AddStringToObject(root, "type", "mcp");
+
+    cJSON_AddStringToObject(payload, "jsonrpc", "2.0");
+    cJSON_AddItemToObject(payload, "id", id_copy);
+
+    cJSON_AddStringToObject(result, "protocolVersion",
+                            protocol_version != NULL ? protocol_version : "2024-11-05");
+    cJSON_AddItemToObject(result, "capabilities", capabilities);
+    cJSON_AddStringToObject(client_info, "name", "rk3568-websocket-test");
+    cJSON_AddStringToObject(client_info, "version", "0.1.0");
+    cJSON_AddItemToObject(result, "clientInfo", client_info);
+    cJSON_AddItemToObject(payload, "result", result);
+    cJSON_AddItemToObject(root, "payload", payload);
+
+    char *msg = cJSON_PrintUnformatted(root);
+    if (msg == NULL) {
+        printf("[mcp] error: failed to print initialize result JSON\n");
+        cJSON_Delete(root);
+        return;
+    }
+
+    printf("[mcp] queue initialize result: %s\n", msg);
+    if (ws_text_enqueue(msg, strlen(msg))) {
+        request_ws_text_write();
+    } else {
+        printf("[mcp] error: failed to queue initialize result\n");
+    }
+
+    free(msg);
+    cJSON_Delete(root);
 }
 
 /* ==================== TTS 消息处理 ==================== */
@@ -596,6 +807,25 @@ static int callback_echo(struct lws *wsi, enum lws_callback_reasons reason,
             break;
         }
 
+        unsigned char text_out[LWS_PRE + WS_TEXT_MAX_SIZE];
+        size_t text_len = 0;
+        if (ws_text_dequeue((char *)&text_out[LWS_PRE], &text_len)) {
+            int n = lws_write(wsi, &text_out[LWS_PRE], text_len, LWS_WRITE_TEXT);
+            g_ws_text_sent_count++;
+            printf("[ws-text] lws_write text returned %d/%zu sent_count=%lu\n",
+                   n, text_len, g_ws_text_sent_count);
+            if (n < 0) {
+                fprintf(stderr, "[ws-text] lws_write text failed\n");
+            } else if (n < (int)text_len) {
+                fprintf(stderr, "[ws-text] lws_write text incomplete: %d/%zu\n", n, text_len);
+            }
+
+            if (ws_text_pending_count() > 0 || audio_tx_pending_count() > 0) {
+                lws_callback_on_writable(wsi);
+            }
+            break;
+        }
+
         unsigned char out[LWS_PRE + UDP_AUDIO_MAX_SIZE];
         size_t payload_len = 0;
         if (audio_tx_dequeue(&out[LWS_PRE], &payload_len)) {
@@ -631,6 +861,7 @@ static int callback_echo(struct lws *wsi, enum lws_callback_reasons reason,
     case LWS_CALLBACK_CLIENT_CLOSED:
         printf("🔒 连接关闭\n");
         stop_audio_thread();
+        ws_text_clear();
         client_wsi = NULL;
         interrupted = 1;
         break;
