@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 
 /* ==================== 配置定义 ==================== */
 #define UDP_FORWARD_IP      "127.0.0.1"
@@ -27,6 +28,7 @@
 typedef enum {
     WS_TEXT_KIND_GENERIC = 0,
     WS_TEXT_KIND_LISTEN_START,
+    WS_TEXT_KIND_LISTEN_STOP,
     WS_TEXT_KIND_MCP_INITIALIZE_RESULT,
     WS_TEXT_KIND_MCP_TOOLS_LIST_RESULT
 } ws_text_kind_t;
@@ -40,6 +42,11 @@ static char g_session_id[128] = {0};
 static int g_session_id_saved = 0;
 static unsigned long g_listen_start_sent_count = 0;
 static int g_listen_after_tools_list_sent = 0;
+static char g_listen_mode[16] = "auto";
+static int g_listen_stop_after_sec = 0;
+static time_t g_after_tools_list_listen_sent_time = 0;
+static int g_listen_stop_queued = 0;
+static int g_listen_stop_sent = 0;
 static int g_mcp_initialize_replied = 0;
 static int g_mcp_initialized_notification_recv = 0;
 static int g_mcp_tools_list_replied = 0;
@@ -120,7 +127,10 @@ static int ws_text_dequeue(char *data, size_t *len, ws_text_kind_t *kind, char *
 static size_t ws_text_pending_count(void);
 static void ws_text_clear(void);
 static void request_ws_text_write(void);
+static void LoadListenConfig(void);
 static void StartListen(struct lws *wsi, const char *reason);
+static void QueueListenStop(struct lws *wsi, const char *reason);
+static void CheckListenStopTimer(void);
 static void ProcessBinDataFrmServer(unsigned char *data, size_t len);
 static void ProcessTxtDataFrmServer(const char *data, size_t len);
 static void ProcessHello(cJSON *root);
@@ -217,14 +227,18 @@ static void audio_tx_clear(void)
 
 static void LogProtocolState(const char *tag)
 {
-    printf("[state] %s session_saved=%d listen_sent=%lu init_replied=%d initialized=%d tools_list_replied=%d after_tools_list_listen=%d\n",
+    printf("[state] %s session_saved=%d listen_sent=%lu init_replied=%d initialized=%d tools_list_replied=%d after_tools_list_listen=%d mode=%s stop_after_sec=%d stop_queued=%d stop_sent=%d\n",
            tag != NULL ? tag : "unknown",
            g_session_id_saved,
            g_listen_start_sent_count,
            g_mcp_initialize_replied,
            g_mcp_initialized_notification_recv,
            g_mcp_tools_list_replied,
-           g_listen_after_tools_list_sent);
+           g_listen_after_tools_list_sent,
+           g_listen_mode,
+           g_listen_stop_after_sec,
+           g_listen_stop_queued,
+           g_listen_stop_sent);
 }
 
 static int ws_text_enqueue_ex(const char *data, size_t len, ws_text_kind_t kind, const char *reason)
@@ -496,7 +510,40 @@ static void stop_audio_thread(void)
     printf("✓ 音频线程已停止\n");
 }
 
-/* ==================== StartListen - 发送监听开始消息 ==================== */
+/* ==================== Listen config ==================== */
+static void LoadListenConfig(void)
+{
+    const char *mode = getenv("XIAOZHI_LISTEN_MODE");
+    const char *stop_after = getenv("XIAOZHI_LISTEN_STOP_AFTER_SEC");
+
+    snprintf(g_listen_mode, sizeof(g_listen_mode), "auto");
+    if (mode != NULL && mode[0] != '\0') {
+        if (strcmp(mode, "manual") == 0) {
+            snprintf(g_listen_mode, sizeof(g_listen_mode), "manual");
+        } else if (strcmp(mode, "auto") == 0) {
+            snprintf(g_listen_mode, sizeof(g_listen_mode), "auto");
+        } else {
+            printf("[listen] warning: unsupported XIAOZHI_LISTEN_MODE=%s, use auto\n", mode);
+        }
+    }
+
+    g_listen_stop_after_sec = 0;
+    if (stop_after != NULL && stop_after[0] != '\0') {
+        char *end = NULL;
+        long value = strtol(stop_after, &end, 10);
+        if (end != stop_after && value > 0 && value <= 3600) {
+            g_listen_stop_after_sec = (int)value;
+        } else {
+            printf("[listen] warning: invalid XIAOZHI_LISTEN_STOP_AFTER_SEC=%s, use 0\n",
+                   stop_after);
+        }
+    }
+
+    printf("[listen] config mode=%s stop_after_sec=%d\n",
+           g_listen_mode, g_listen_stop_after_sec);
+}
+
+/* ==================== StartListen ==================== */
 static void StartListen(struct lws *wsi, const char *reason)
 {
     if (wsi == NULL || interrupted) {
@@ -515,7 +562,7 @@ static void StartListen(struct lws *wsi, const char *reason)
     cJSON_AddStringToObject(root, "session_id", g_session_id);
     cJSON_AddStringToObject(root, "type", "listen");
     cJSON_AddStringToObject(root, "state", "start");
-    cJSON_AddStringToObject(root, "mode", "auto");
+    cJSON_AddStringToObject(root, "mode", g_listen_mode);
     
     char *msg = cJSON_PrintUnformatted(root);
     if (msg == NULL) {
@@ -523,7 +570,8 @@ static void StartListen(struct lws *wsi, const char *reason)
         return;
     }
     
-    printf("[listen] queue start reason=%s session_id=%s\n", listen_reason, g_session_id);
+    printf("[listen] queue start reason=%s session_id=%s mode=%s\n",
+           listen_reason, g_session_id, g_listen_mode);
     printf("[listen] start JSON: %s\n", msg);
     printf("📤 [发送] listen 消息：%s\n", msg);
     if (ws_text_enqueue_ex(msg, strlen(msg), WS_TEXT_KIND_LISTEN_START, listen_reason)) {
@@ -535,6 +583,73 @@ static void StartListen(struct lws *wsi, const char *reason)
     cJSON_Delete(root);
     free(msg);
     return;
+}
+
+/* ==================== Queue listen stop ==================== */
+static void QueueListenStop(struct lws *wsi, const char *reason)
+{
+    if (wsi == NULL || interrupted) {
+        return;
+    }
+
+    if (g_session_id[0] == '\0') {
+        printf("[listen] warning: skip stop reason=%s because session_id is empty\n",
+               reason != NULL ? reason : "unknown");
+        return;
+    }
+
+    const char *listen_reason = reason != NULL ? reason : "unknown";
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "session_id", g_session_id);
+    cJSON_AddStringToObject(root, "type", "listen");
+    cJSON_AddStringToObject(root, "state", "stop");
+
+    char *msg = cJSON_PrintUnformatted(root);
+    if (msg == NULL) {
+        cJSON_Delete(root);
+        return;
+    }
+
+    printf("[listen] queue stop reason=%s session_id=%s\n", listen_reason, g_session_id);
+    printf("[listen] stop JSON: %s\n", msg);
+    if (ws_text_enqueue_ex(msg, strlen(msg), WS_TEXT_KIND_LISTEN_STOP, listen_reason)) {
+        g_listen_stop_queued = 1;
+        request_ws_text_write();
+    } else {
+        printf("[listen] error: failed to queue stop reason=%s\n", listen_reason);
+    }
+
+    cJSON_Delete(root);
+    free(msg);
+}
+
+static void CheckListenStopTimer(void)
+{
+    if (client_wsi == NULL || interrupted) {
+        return;
+    }
+
+    if (strcmp(g_listen_mode, "manual") != 0 || g_listen_stop_after_sec <= 0) {
+        return;
+    }
+
+    if (!g_listen_after_tools_list_sent || g_after_tools_list_listen_sent_time == 0 ||
+        g_listen_stop_queued || g_listen_stop_sent) {
+        return;
+    }
+
+    time_t now = time(NULL);
+    if (now == (time_t)-1) {
+        return;
+    }
+
+    if ((int)(now - g_after_tools_list_listen_sent_time) >= g_listen_stop_after_sec) {
+        printf("[listen] stop timer expired elapsed=%ld stop_after_sec=%d\n",
+               (long)(now - g_after_tools_list_listen_sent_time),
+               g_listen_stop_after_sec);
+        QueueListenStop(client_wsi, "manual_stop_after_tools_list");
+    }
 }
 
 /* ==================== 二进制数据处理 ==================== */
@@ -871,6 +986,9 @@ static int callback_echo(struct lws *wsi, enum lws_callback_reasons reason,
         g_session_id_saved = 0;
         g_listen_start_sent_count = 0;
         g_listen_after_tools_list_sent = 0;
+        g_after_tools_list_listen_sent_time = 0;
+        g_listen_stop_queued = 0;
+        g_listen_stop_sent = 0;
         g_mcp_initialize_replied = 0;
         g_mcp_initialized_notification_recv = 0;
         g_mcp_tools_list_replied = 0;
@@ -942,10 +1060,19 @@ static int callback_echo(struct lws *wsi, enum lws_callback_reasons reason,
                 g_listen_start_sent_count++;
                 if (strcmp(text_reason, "after_tools_list") == 0) {
                     g_listen_after_tools_list_sent = 1;
+                    g_after_tools_list_listen_sent_time = time(NULL);
+                    printf("[listen] after_tools_list sent_time=%ld stop_after_sec=%d\n",
+                           (long)g_after_tools_list_listen_sent_time,
+                           g_listen_stop_after_sec);
                 }
                 printf("[listen] sent start reason=%s ret=%d/%zu\n",
                        text_reason[0] != '\0' ? text_reason : "unknown", n, text_len);
                 LogProtocolState("listen_start_sent");
+            } else if (text_kind == WS_TEXT_KIND_LISTEN_STOP) {
+                g_listen_stop_sent = 1;
+                printf("[listen] sent stop reason=%s ret=%d/%zu\n",
+                       text_reason[0] != '\0' ? text_reason : "unknown", n, text_len);
+                LogProtocolState("listen_stop_sent");
             } else if (text_kind == WS_TEXT_KIND_MCP_INITIALIZE_RESULT) {
                 g_mcp_initialize_replied = 1;
                 printf("[mcp] initialize result sent ret=%d/%zu\n", n, text_len);
@@ -1050,6 +1177,7 @@ int main(void) {
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
     signal(SIGPIPE, SIG_IGN);
+    LoadListenConfig();
     
     printf("========================================\n");
     printf("小智 WebSocket 客户端 (websocket_test)\n");
@@ -1102,6 +1230,7 @@ int main(void) {
     
     while (!interrupted) {
         lws_service(context, 50);
+        CheckListenStopTimer();
     }
     
     printf("正在清理资源...\n");
