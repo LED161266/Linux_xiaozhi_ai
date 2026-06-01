@@ -85,6 +85,9 @@ static unsigned long g_ws_audio_sent_count = 0;
 static unsigned long g_server_binary_recv_count = 0;
 static unsigned long g_udp_forward_sent_count = 0;
 static unsigned long g_udp_forward_send_fail_count = 0;
+static int g_upload_audio_only_when_listening = 0;
+static int g_audio_upload_enabled = 1;
+static unsigned long g_udp9001_gated_drop_count = 0;
 
 static pthread_mutex_t g_ws_text_mutex = PTHREAD_MUTEX_INITIALIZER;
 static ws_text_packet_t g_ws_text_queue[WS_TEXT_QUEUE_DEPTH];
@@ -233,21 +236,26 @@ static void PrintAudioStats(const char *tag)
     unsigned long udp_recv = 0;
     unsigned long queued = 0;
     unsigned long dropped = 0;
+    unsigned long gated_dropped = 0;
     size_t pending = 0;
+    int upload_enabled = 0;
 
     pthread_mutex_lock(&g_audio_tx_mutex);
     udp_recv = g_udp_audio_recv_count;
     queued = g_audio_tx_enqueued_count;
     dropped = g_audio_tx_dropped_count;
+    gated_dropped = g_udp9001_gated_drop_count;
     pending = g_audio_tx_count;
+    upload_enabled = g_audio_upload_enabled;
     pthread_mutex_unlock(&g_audio_tx_mutex);
 
-    printf("[stats] %s udp9001_recv=%lu ws_binary_sent=%lu audio_queue_queued=%lu audio_queue_dropped=%lu audio_queue_pending=%zu server_binary_recv=%lu udp9002_sent=%lu udp9002_send_failed=%lu listen_start_sent=%lu listen_stop_sent=%lu listen_mode=%s stop_after_sec=%d ws_text_sent=%lu ws_text_dropped=%lu\n",
+    printf("[stats] %s udp9001_recv=%lu ws_binary_sent=%lu audio_queue_queued=%lu audio_queue_dropped=%lu udp9001_gated_drop=%lu audio_queue_pending=%zu server_binary_recv=%lu udp9002_sent=%lu udp9002_send_failed=%lu listen_start_sent=%lu listen_stop_sent=%lu listen_mode=%s stop_after_sec=%d upload_audio_only_when_listening=%d audio_upload_enabled=%d ws_text_sent=%lu ws_text_dropped=%lu\n",
            tag != NULL ? tag : "final",
            udp_recv,
            g_ws_audio_sent_count,
            queued,
            dropped,
+           gated_dropped,
            pending,
            g_server_binary_recv_count,
            g_udp_forward_sent_count,
@@ -256,6 +264,8 @@ static void PrintAudioStats(const char *tag)
            g_listen_stop_sent_count,
            g_listen_mode,
            g_listen_stop_after_sec,
+           g_upload_audio_only_when_listening,
+           upload_enabled,
            g_ws_text_sent_count,
            g_ws_text_dropped_count);
 }
@@ -451,6 +461,9 @@ static void *AudioThread(void *arg)
     unsigned char buffer[UDP_AUDIO_MAX_SIZE];
     struct sockaddr_in client_addr;
     socklen_t addr_len = sizeof(client_addr);
+    int upload_allowed = 1;
+    unsigned long gated_drop_snapshot = 0;
+    unsigned long recv_snapshot = 0;
     
     printf("🎤 [音频线程] 启动，监听 UDP %s:%d\n", UDP_AUDIO_IP, UDP_AUDIO_PORT);
     
@@ -480,7 +493,21 @@ static void *AudioThread(void *arg)
         
         pthread_mutex_lock(&g_audio_tx_mutex);
         g_udp_audio_recv_count++;
+        recv_snapshot = g_udp_audio_recv_count;
+        upload_allowed = (!g_upload_audio_only_when_listening || g_audio_upload_enabled);
+        if (!upload_allowed) {
+            g_udp9001_gated_drop_count++;
+            gated_drop_snapshot = g_udp9001_gated_drop_count;
+        }
         pthread_mutex_unlock(&g_audio_tx_mutex);
+
+        if (!upload_allowed) {
+            if (gated_drop_snapshot <= 5 || (gated_drop_snapshot % 1000) == 0) {
+                printf("[audio-gate] gated_drop=%lu udp9001_recv=%lu upload_enabled=0\n",
+                       gated_drop_snapshot, recv_snapshot);
+            }
+            continue;
+        }
 
         if (client_wsi != NULL && g_audio_thread_running && !interrupted) {
             if (audio_tx_enqueue(buffer, (size_t)recv_len)) {
@@ -550,6 +577,7 @@ static void LoadListenConfig(void)
 {
     const char *mode = getenv("XIAOZHI_LISTEN_MODE");
     const char *stop_after = getenv("XIAOZHI_LISTEN_STOP_AFTER_SEC");
+    const char *upload_gate = getenv("XIAOZHI_UPLOAD_AUDIO_ONLY_WHEN_LISTENING");
 
     snprintf(g_listen_mode, sizeof(g_listen_mode), "auto");
     if (mode != NULL && mode[0] != '\0') {
@@ -574,8 +602,16 @@ static void LoadListenConfig(void)
         }
     }
 
-    printf("[listen] config mode=%s stop_after_sec=%d\n",
-           g_listen_mode, g_listen_stop_after_sec);
+    g_upload_audio_only_when_listening = 0;
+    g_audio_upload_enabled = 1;
+    if (upload_gate != NULL && upload_gate[0] != '\0') {
+        g_upload_audio_only_when_listening = atoi(upload_gate) == 1 ? 1 : 0;
+        g_audio_upload_enabled = g_upload_audio_only_when_listening ? 0 : 1;
+    }
+
+    printf("[listen] config mode=%s stop_after_sec=%d upload_audio_only_when_listening=%d audio_upload_enabled=%d\n",
+           g_listen_mode, g_listen_stop_after_sec,
+           g_upload_audio_only_when_listening, g_audio_upload_enabled);
 }
 
 /* ==================== StartListen ==================== */
@@ -1030,6 +1066,8 @@ static int callback_echo(struct lws *wsi, enum lws_callback_reasons reason,
         g_listen_stop_queued = 0;
         g_listen_stop_sent = 0;
         g_listen_stop_sent_count = 0;
+        g_audio_upload_enabled = g_upload_audio_only_when_listening ? 0 : 1;
+        g_udp9001_gated_drop_count = 0;
         g_mcp_initialize_replied = 0;
         g_mcp_initialized_notification_recv = 0;
         g_mcp_tools_list_replied = 0;
@@ -1099,6 +1137,13 @@ static int callback_echo(struct lws *wsi, enum lws_callback_reasons reason,
                 fprintf(stderr, "[ws-text] lws_write text incomplete: %d/%zu\n", n, text_len);
             } else if (text_kind == WS_TEXT_KIND_LISTEN_START) {
                 g_listen_start_sent_count++;
+                if (g_upload_audio_only_when_listening) {
+                    pthread_mutex_lock(&g_audio_tx_mutex);
+                    g_audio_upload_enabled = 1;
+                    pthread_mutex_unlock(&g_audio_tx_mutex);
+                    printf("[audio-gate] upload enabled after listen start reason=%s\n",
+                           text_reason[0] != '\0' ? text_reason : "unknown");
+                }
                 if (strcmp(text_reason, "after_tools_list") == 0) {
                     g_listen_after_tools_list_sent = 1;
                     g_after_tools_list_listen_sent_time = time(NULL);
@@ -1112,6 +1157,13 @@ static int callback_echo(struct lws *wsi, enum lws_callback_reasons reason,
             } else if (text_kind == WS_TEXT_KIND_LISTEN_STOP) {
                 g_listen_stop_sent = 1;
                 g_listen_stop_sent_count++;
+                if (g_upload_audio_only_when_listening) {
+                    pthread_mutex_lock(&g_audio_tx_mutex);
+                    g_audio_upload_enabled = 0;
+                    pthread_mutex_unlock(&g_audio_tx_mutex);
+                    printf("[audio-gate] upload disabled after listen stop reason=%s\n",
+                           text_reason[0] != '\0' ? text_reason : "unknown");
+                }
                 printf("[listen] sent stop reason=%s ret=%d/%zu\n",
                        text_reason[0] != '\0' ? text_reason : "unknown", n, text_len);
                 LogProtocolState("listen_stop_sent");
