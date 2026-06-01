@@ -366,9 +366,14 @@ static void StartListen(struct lws *wsi)
     if (wsi == NULL || interrupted) {
         return;
     }
+
+    if (g_session_id[0] == '\0') {
+        printf("[session] warning: skip listen start because session_id is empty\n");
+        return;
+    }
     
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "session_id", "");
+    cJSON_AddStringToObject(root, "session_id", g_session_id);
     cJSON_AddStringToObject(root, "type", "listen");
     cJSON_AddStringToObject(root, "state", "start");
     cJSON_AddStringToObject(root, "mode", "auto");
@@ -379,6 +384,7 @@ static void StartListen(struct lws *wsi)
         return;
     }
     
+    printf("[session] listen start using session_id=%s\n", g_session_id);
     printf("📤 [发送] listen 消息：%s\n", msg);
     
     // 使用 malloc 创建缓冲区（参考 websocket.c）
@@ -457,6 +463,24 @@ static void ProcessTxtDataFrmServer(const char *data, size_t len)
 static void ProcessHello(cJSON *root)
 {
     printf("✅ [Hello] 服务器握手响应\n");
+    cJSON *session_item = cJSON_GetObjectItemCaseSensitive(root, "session_id");
+    if (cJSON_IsString(session_item) && session_item->valuestring != NULL &&
+        session_item->valuestring[0] != '\0') {
+        snprintf(g_session_id, sizeof(g_session_id), "%s", session_item->valuestring);
+        printf("[session] saved session_id=%s\n", g_session_id);
+    } else {
+        g_session_id[0] = '\0';
+        printf("[session] warning: hello response has no session_id\n");
+    }
+
+    cJSON *audio_params = cJSON_GetObjectItemCaseSensitive(root, "audio_params");
+    if (cJSON_IsObject(audio_params)) {
+        cJSON *sample_rate = cJSON_GetObjectItemCaseSensitive(audio_params, "sample_rate");
+        if (cJSON_IsNumber(sample_rate)) {
+            printf("[protocol] server audio sample_rate=%d\n", sample_rate->valueint);
+        }
+    }
+
     if (client_wsi) {
         StartListen(client_wsi);
     }
@@ -524,6 +548,7 @@ static int callback_echo(struct lws *wsi, enum lws_callback_reasons reason,
         printf("✅ 连接成功！\n");
         client_wsi = wsi;
         hello_sent = 0;
+        g_session_id[0] = '\0';
         start_audio_thread();
         lws_callback_on_writable(wsi);
         break;
