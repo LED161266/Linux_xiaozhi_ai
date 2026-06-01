@@ -110,6 +110,7 @@ static void ProcessTxtDataFrmServer(const char *data, size_t len);
 static void ProcessHello(cJSON *root);
 static void ProcessMCP(cJSON *root);
 static void SendMCPInitializeResult(cJSON *request_id, const char *protocol_version);
+static void SendMCPToolsListResult(cJSON *request_id);
 static void ProcessTTS(cJSON *root);
 static void ProcessSTT(cJSON *root);
 
@@ -633,6 +634,12 @@ static void ProcessMCP(cJSON *root)
     if (strcmp(method->valuestring, "initialize") == 0) {
         printf("[mcp] received initialize request\n");
         SendMCPInitializeResult(id, protocol_version_text);
+    } else if (strcmp(method->valuestring, "tools/list") == 0) {
+        printf("[mcp] received tools/list request\n");
+        SendMCPToolsListResult(id);
+    } else if (id == NULL) {
+        printf("[mcp] received MCP notification: %s\n", method->valuestring);
+        printf("[mcp] no response required\n");
     }
 }
 
@@ -691,6 +698,67 @@ static void SendMCPInitializeResult(cJSON *request_id, const char *protocol_vers
         request_ws_text_write();
     } else {
         printf("[mcp] error: failed to queue initialize result\n");
+    }
+
+    free(msg);
+    cJSON_Delete(root);
+}
+
+/* ==================== MCP tools/list 响应 ==================== */
+static void SendMCPToolsListResult(cJSON *request_id)
+{
+    if (request_id == NULL || (!cJSON_IsNumber(request_id) && !cJSON_IsString(request_id))) {
+        printf("[mcp] warning: skip tools/list result because request id is missing\n");
+        return;
+    }
+
+    if (cJSON_IsNumber(request_id)) {
+        printf("[mcp] tools/list request id=%g\n", request_id->valuedouble);
+    } else {
+        printf("[mcp] tools/list request id=%s\n", request_id->valuestring);
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *payload = cJSON_CreateObject();
+    cJSON *result = cJSON_CreateObject();
+    cJSON *tools = cJSON_CreateArray();
+    cJSON *id_copy = cJSON_Duplicate(request_id, 1);
+
+    if (root == NULL || payload == NULL || result == NULL ||
+        tools == NULL || id_copy == NULL) {
+        printf("[mcp] error: failed to allocate tools/list result JSON\n");
+        cJSON_Delete(root);
+        cJSON_Delete(payload);
+        cJSON_Delete(result);
+        cJSON_Delete(tools);
+        cJSON_Delete(id_copy);
+        return;
+    }
+
+    if (g_session_id[0] != '\0') {
+        cJSON_AddStringToObject(root, "session_id", g_session_id);
+    }
+    cJSON_AddStringToObject(root, "type", "mcp");
+
+    cJSON_AddStringToObject(payload, "jsonrpc", "2.0");
+    cJSON_AddItemToObject(payload, "id", id_copy);
+    cJSON_AddItemToObject(result, "tools", tools);
+    cJSON_AddItemToObject(payload, "result", result);
+    cJSON_AddItemToObject(root, "payload", payload);
+
+    char *msg = cJSON_PrintUnformatted(root);
+    if (msg == NULL) {
+        printf("[mcp] error: failed to print tools/list result JSON\n");
+        cJSON_Delete(root);
+        return;
+    }
+
+    printf("[mcp] queue tools/list result: %s\n", msg);
+    if (ws_text_enqueue(msg, strlen(msg))) {
+        printf("[mcp] tools/list result queued for writeable callback\n");
+        request_ws_text_write();
+    } else {
+        printf("[mcp] error: failed to queue tools/list result\n");
     }
 
     free(msg);
