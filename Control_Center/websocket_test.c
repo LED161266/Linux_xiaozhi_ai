@@ -18,11 +18,14 @@
 #define UDP_AUDIO_IP        "127.0.0.1"
 #define UDP_AUDIO_PORT      9001
 #define UDP_AUDIO_MAX_SIZE  4096
+#define AUDIO_TX_QUEUE_DEPTH 64
+#define AUDIO_LOG_INTERVAL  500
 #define DEFAULT_PROTOCOL    "xiaozhi-protocol"
 
 /* ==================== 全局变量 ==================== */
 static volatile sig_atomic_t interrupted = 0;
 static struct lws *client_wsi = NULL;
+static struct lws_context *g_lws_context = NULL;
 static int hello_sent = 0;
 static char g_session_id[128] = {0};
 
@@ -35,6 +38,23 @@ static pthread_t g_audio_thread = 0;
 static volatile int g_audio_thread_running = 0;
 static int g_udp_audio_sockfd = -1;
 static struct sockaddr_in g_udp_audio_addr;
+
+typedef struct {
+    size_t len;
+    unsigned char data[UDP_AUDIO_MAX_SIZE];
+} audio_tx_packet_t;
+
+static pthread_mutex_t g_audio_tx_mutex = PTHREAD_MUTEX_INITIALIZER;
+static audio_tx_packet_t g_audio_tx_queue[AUDIO_TX_QUEUE_DEPTH];
+static size_t g_audio_tx_head = 0;
+static size_t g_audio_tx_tail = 0;
+static size_t g_audio_tx_count = 0;
+static unsigned long g_udp_audio_recv_count = 0;
+static unsigned long g_audio_tx_enqueued_count = 0;
+static unsigned long g_audio_tx_dropped_count = 0;
+static unsigned long g_ws_audio_sent_count = 0;
+static unsigned long g_server_binary_recv_count = 0;
+static unsigned long g_udp_forward_sent_count = 0;
 
 /* 连接参数 */
 struct connection_params {
@@ -59,12 +79,115 @@ static void cleanup_udp_audio_recv(void);
 static void *AudioThread(void *arg);
 static void start_audio_thread(void);
 static void stop_audio_thread(void);
+static int audio_tx_enqueue(const unsigned char *data, size_t len);
+static int audio_tx_dequeue(unsigned char *data, size_t *len);
+static size_t audio_tx_pending_count(void);
+static void audio_tx_clear(void);
+static void request_ws_audio_write(void);
 static void StartListen(struct lws *wsi);
 static void ProcessBinDataFrmServer(unsigned char *data, size_t len);
 static void ProcessTxtDataFrmServer(const char *data, size_t len);
 static void ProcessHello(cJSON *root);
 static void ProcessTTS(cJSON *root);
 static void ProcessSTT(cJSON *root);
+
+static int audio_tx_enqueue(const unsigned char *data, size_t len)
+{
+    int queued = 0;
+    unsigned long recv_snapshot = 0;
+    unsigned long enqueued_snapshot = 0;
+    unsigned long dropped_snapshot = 0;
+    size_t pending_snapshot = 0;
+
+    if (data == NULL || len == 0 || len > UDP_AUDIO_MAX_SIZE) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_audio_tx_mutex);
+
+    if (g_audio_tx_count == AUDIO_TX_QUEUE_DEPTH) {
+        g_audio_tx_head = (g_audio_tx_head + 1) % AUDIO_TX_QUEUE_DEPTH;
+        g_audio_tx_count--;
+        g_audio_tx_dropped_count++;
+    }
+
+    g_audio_tx_queue[g_audio_tx_tail].len = len;
+    memcpy(g_audio_tx_queue[g_audio_tx_tail].data, data, len);
+    g_audio_tx_tail = (g_audio_tx_tail + 1) % AUDIO_TX_QUEUE_DEPTH;
+    g_audio_tx_count++;
+    g_audio_tx_enqueued_count++;
+    queued = 1;
+
+    recv_snapshot = g_udp_audio_recv_count;
+    enqueued_snapshot = g_audio_tx_enqueued_count;
+    dropped_snapshot = g_audio_tx_dropped_count;
+    pending_snapshot = g_audio_tx_count;
+
+    pthread_mutex_unlock(&g_audio_tx_mutex);
+
+    if (recv_snapshot <= 5 || (recv_snapshot % AUDIO_LOG_INTERVAL) == 0 ||
+        (dropped_snapshot > 0 && (dropped_snapshot <= 5 || (dropped_snapshot % 100) == 0))) {
+        printf("[audio] udp_recv=%lu queued=%lu dropped=%lu pending=%zu last_len=%zu\n",
+               recv_snapshot, enqueued_snapshot, dropped_snapshot, pending_snapshot, len);
+    }
+
+    return queued;
+}
+
+static int audio_tx_dequeue(unsigned char *data, size_t *len)
+{
+    if (data == NULL || len == NULL) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_audio_tx_mutex);
+
+    if (g_audio_tx_count == 0) {
+        pthread_mutex_unlock(&g_audio_tx_mutex);
+        return 0;
+    }
+
+    *len = g_audio_tx_queue[g_audio_tx_head].len;
+    memcpy(data, g_audio_tx_queue[g_audio_tx_head].data, *len);
+    g_audio_tx_head = (g_audio_tx_head + 1) % AUDIO_TX_QUEUE_DEPTH;
+    g_audio_tx_count--;
+
+    pthread_mutex_unlock(&g_audio_tx_mutex);
+    return 1;
+}
+
+static size_t audio_tx_pending_count(void)
+{
+    size_t pending = 0;
+
+    pthread_mutex_lock(&g_audio_tx_mutex);
+    pending = g_audio_tx_count;
+    pthread_mutex_unlock(&g_audio_tx_mutex);
+
+    return pending;
+}
+
+static void audio_tx_clear(void)
+{
+    pthread_mutex_lock(&g_audio_tx_mutex);
+    g_audio_tx_head = 0;
+    g_audio_tx_tail = 0;
+    g_audio_tx_count = 0;
+    pthread_mutex_unlock(&g_audio_tx_mutex);
+}
+
+static void request_ws_audio_write(void)
+{
+    struct lws *wsi = client_wsi;
+
+    if (wsi != NULL && !interrupted) {
+        lws_callback_on_writable(wsi);
+    }
+
+    if (g_lws_context != NULL) {
+        lws_cancel_service(g_lws_context);
+    }
+}
 
 /* ==================== UDP 转发初始化 ==================== */
 static int init_udp_forward(void)
@@ -170,22 +293,13 @@ static void *AudioThread(void *arg)
             }
         }
         
-        // 通过 WebSocket 发送二进制数据（使用 malloc 创建缓冲区）
+        pthread_mutex_lock(&g_audio_tx_mutex);
+        g_udp_audio_recv_count++;
+        pthread_mutex_unlock(&g_audio_tx_mutex);
+
         if (client_wsi != NULL && g_audio_thread_running && !interrupted) {
-            unsigned char *pkt = malloc(LWS_PRE + recv_len);
-            if (pkt) {
-                memcpy(&pkt[LWS_PRE], buffer, recv_len);
-                
-                int sent = lws_write(client_wsi, &pkt[LWS_PRE], recv_len, LWS_WRITE_BINARY);
-                if (sent < 0) {
-                    fprintf(stderr, "⚠️  WebSocket 发送失败\n");
-                } else if (sent < recv_len) {
-                    fprintf(stderr, "⚠️  WebSocket 发送不完整：%d/%zd 字节\n", sent, recv_len);
-                }
-                
-                free(pkt);
-            } else {
-                fprintf(stderr, "⚠️  内存分配失败\n");
+            if (audio_tx_enqueue(buffer, (size_t)recv_len)) {
+                request_ws_audio_write();
             }
         }
     }
@@ -242,6 +356,7 @@ static void stop_audio_thread(void)
     }
     
     g_audio_thread = 0;
+    audio_tx_clear();
     printf("✓ 音频线程已停止\n");
 }
 
@@ -290,11 +405,19 @@ static void StartListen(struct lws *wsi)
 static void ProcessBinDataFrmServer(unsigned char *data, size_t len)
 {
     if (g_udp_forward_sockfd >= 0 && !interrupted && len > 0) {
+        g_server_binary_recv_count++;
         ssize_t sent = sendto(g_udp_forward_sockfd, data, len, 0,
                               (struct sockaddr *)&g_udp_forward_addr, 
                               sizeof(g_udp_forward_addr));
         if (sent < 0) {
             perror("❌ UDP 转发失败");
+        } else {
+            g_udp_forward_sent_count++;
+            if (g_server_binary_recv_count <= 5 ||
+                (g_server_binary_recv_count % AUDIO_LOG_INTERVAL) == 0) {
+                printf("[audio] server_binary_recv=%lu len=%zu udp9002_sent=%lu sent_len=%zd\n",
+                       g_server_binary_recv_count, len, g_udp_forward_sent_count, sent);
+            }
         }
     }
 }
@@ -441,6 +564,34 @@ static int callback_echo(struct lws *wsi, enum lws_callback_reasons reason,
             cJSON_Delete(root);
             free(msg);
             hello_sent = 1;
+
+            if (audio_tx_pending_count() > 0) {
+                lws_callback_on_writable(wsi);
+            }
+            break;
+        }
+
+        unsigned char out[LWS_PRE + UDP_AUDIO_MAX_SIZE];
+        size_t payload_len = 0;
+        if (audio_tx_dequeue(&out[LWS_PRE], &payload_len)) {
+            int n = lws_write(wsi, &out[LWS_PRE], payload_len, LWS_WRITE_BINARY);
+            if (n < 0) {
+                fprintf(stderr, "[audio] lws_write binary failed\n");
+            } else if (n < (int)payload_len) {
+                fprintf(stderr, "[audio] lws_write binary incomplete: %d/%zu\n", n, payload_len);
+            } else {
+                g_ws_audio_sent_count++;
+                if (g_ws_audio_sent_count <= 5 ||
+                    (g_ws_audio_sent_count % AUDIO_LOG_INTERVAL) == 0) {
+                    printf("[audio] ws_binary_sent=%lu len=%zu pending=%zu dropped=%lu\n",
+                           g_ws_audio_sent_count, payload_len,
+                           audio_tx_pending_count(), g_audio_tx_dropped_count);
+                }
+            }
+
+            if (audio_tx_pending_count() > 0) {
+                lws_callback_on_writable(wsi);
+            }
         }
         break;
     
@@ -520,6 +671,7 @@ int main(void) {
         cleanup_udp_forward();
         return 1;
     }
+    g_lws_context = context;
     
     memset(&conn_info, 0, sizeof(conn_info));
     conn_info.context = context;
@@ -537,6 +689,7 @@ int main(void) {
     struct lws *wsi = lws_client_connect_via_info(&conn_info);
     if (!wsi) {
         fprintf(stderr, "连接失败\n");
+        g_lws_context = NULL;
         lws_context_destroy(context);
         cleanup_udp_forward();
         return 1;
@@ -554,6 +707,7 @@ int main(void) {
         stop_audio_thread();
     }
     
+    g_lws_context = NULL;
     lws_context_destroy(context);
     cleanup_udp_forward();
     
