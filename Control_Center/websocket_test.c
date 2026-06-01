@@ -24,12 +24,25 @@
 #define WS_TEXT_QUEUE_DEPTH 8
 #define DEFAULT_PROTOCOL    "xiaozhi-protocol"
 
+typedef enum {
+    WS_TEXT_KIND_GENERIC = 0,
+    WS_TEXT_KIND_LISTEN_START,
+    WS_TEXT_KIND_MCP_INITIALIZE_RESULT,
+    WS_TEXT_KIND_MCP_TOOLS_LIST_RESULT
+} ws_text_kind_t;
+
 /* ==================== 全局变量 ==================== */
 static volatile sig_atomic_t interrupted = 0;
 static struct lws *client_wsi = NULL;
 static struct lws_context *g_lws_context = NULL;
 static int hello_sent = 0;
 static char g_session_id[128] = {0};
+static int g_session_id_saved = 0;
+static unsigned long g_listen_start_sent_count = 0;
+static int g_listen_after_tools_list_sent = 0;
+static int g_mcp_initialize_replied = 0;
+static int g_mcp_initialized_notification_recv = 0;
+static int g_mcp_tools_list_replied = 0;
 
 /* UDP 转发 */
 static int g_udp_forward_sockfd = -1;
@@ -48,6 +61,8 @@ typedef struct {
 
 typedef struct {
     size_t len;
+    ws_text_kind_t kind;
+    char reason[32];
     char data[WS_TEXT_MAX_SIZE];
 } ws_text_packet_t;
 
@@ -99,12 +114,13 @@ static int audio_tx_dequeue(unsigned char *data, size_t *len);
 static size_t audio_tx_pending_count(void);
 static void audio_tx_clear(void);
 static void request_ws_audio_write(void);
-static int ws_text_enqueue(const char *data, size_t len);
-static int ws_text_dequeue(char *data, size_t *len);
+static void LogProtocolState(const char *tag);
+static int ws_text_enqueue_ex(const char *data, size_t len, ws_text_kind_t kind, const char *reason);
+static int ws_text_dequeue(char *data, size_t *len, ws_text_kind_t *kind, char *reason, size_t reason_size);
 static size_t ws_text_pending_count(void);
 static void ws_text_clear(void);
 static void request_ws_text_write(void);
-static void StartListen(struct lws *wsi);
+static void StartListen(struct lws *wsi, const char *reason);
 static void ProcessBinDataFrmServer(unsigned char *data, size_t len);
 static void ProcessTxtDataFrmServer(const char *data, size_t len);
 static void ProcessHello(cJSON *root);
@@ -199,7 +215,19 @@ static void audio_tx_clear(void)
     pthread_mutex_unlock(&g_audio_tx_mutex);
 }
 
-static int ws_text_enqueue(const char *data, size_t len)
+static void LogProtocolState(const char *tag)
+{
+    printf("[state] %s session_saved=%d listen_sent=%lu init_replied=%d initialized=%d tools_list_replied=%d after_tools_list_listen=%d\n",
+           tag != NULL ? tag : "unknown",
+           g_session_id_saved,
+           g_listen_start_sent_count,
+           g_mcp_initialize_replied,
+           g_mcp_initialized_notification_recv,
+           g_mcp_tools_list_replied,
+           g_listen_after_tools_list_sent);
+}
+
+static int ws_text_enqueue_ex(const char *data, size_t len, ws_text_kind_t kind, const char *reason)
 {
     if (data == NULL || len == 0 || len >= WS_TEXT_MAX_SIZE) {
         printf("[ws-text] warning: skip invalid text frame len=%zu\n", len);
@@ -217,6 +245,10 @@ static int ws_text_enqueue(const char *data, size_t len)
     }
 
     g_ws_text_queue[g_ws_text_tail].len = len;
+    g_ws_text_queue[g_ws_text_tail].kind = kind;
+    snprintf(g_ws_text_queue[g_ws_text_tail].reason,
+             sizeof(g_ws_text_queue[g_ws_text_tail].reason),
+             "%s", reason != NULL ? reason : "");
     memcpy(g_ws_text_queue[g_ws_text_tail].data, data, len);
     g_ws_text_queue[g_ws_text_tail].data[len] = '\0';
     g_ws_text_tail = (g_ws_text_tail + 1) % WS_TEXT_QUEUE_DEPTH;
@@ -226,7 +258,7 @@ static int ws_text_enqueue(const char *data, size_t len)
     return 1;
 }
 
-static int ws_text_dequeue(char *data, size_t *len)
+static int ws_text_dequeue(char *data, size_t *len, ws_text_kind_t *kind, char *reason, size_t reason_size)
 {
     if (data == NULL || len == NULL) {
         return 0;
@@ -240,6 +272,12 @@ static int ws_text_dequeue(char *data, size_t *len)
     }
 
     *len = g_ws_text_queue[g_ws_text_head].len;
+    if (kind != NULL) {
+        *kind = g_ws_text_queue[g_ws_text_head].kind;
+    }
+    if (reason != NULL && reason_size > 0) {
+        snprintf(reason, reason_size, "%s", g_ws_text_queue[g_ws_text_head].reason);
+    }
     memcpy(data, g_ws_text_queue[g_ws_text_head].data, *len);
     data[*len] = '\0';
     g_ws_text_head = (g_ws_text_head + 1) % WS_TEXT_QUEUE_DEPTH;
@@ -459,16 +497,19 @@ static void stop_audio_thread(void)
 }
 
 /* ==================== StartListen - 发送监听开始消息 ==================== */
-static void StartListen(struct lws *wsi)
+static void StartListen(struct lws *wsi, const char *reason)
 {
     if (wsi == NULL || interrupted) {
         return;
     }
 
     if (g_session_id[0] == '\0') {
-        printf("[session] warning: skip listen start because session_id is empty\n");
+        printf("[listen] warning: skip start reason=%s because session_id is empty\n",
+               reason != NULL ? reason : "unknown");
         return;
     }
+
+    const char *listen_reason = reason != NULL ? reason : "unknown";
     
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "session_id", g_session_id);
@@ -482,27 +523,18 @@ static void StartListen(struct lws *wsi)
         return;
     }
     
-    printf("[session] listen start using session_id=%s\n", g_session_id);
+    printf("[listen] queue start reason=%s session_id=%s\n", listen_reason, g_session_id);
+    printf("[listen] start JSON: %s\n", msg);
     printf("📤 [发送] listen 消息：%s\n", msg);
-    
-    // 使用 malloc 创建缓冲区（参考 websocket.c）
-    unsigned char *buf = malloc(LWS_PRE + strlen(msg));
-    if (!buf) {
-        cJSON_Delete(root);
-        free(msg);
-        return;
+    if (ws_text_enqueue_ex(msg, strlen(msg), WS_TEXT_KIND_LISTEN_START, listen_reason)) {
+        request_ws_text_write();
+    } else {
+        printf("[listen] error: failed to queue start reason=%s\n", listen_reason);
     }
-    
-    memcpy(&buf[LWS_PRE], msg, strlen(msg));
-    
-    int sent = lws_write(wsi, &buf[LWS_PRE], strlen(msg), LWS_WRITE_TEXT);
-    if (sent < (int)strlen(msg)) {
-        printf("❌ 发送 listen 消息失败\n");
-    }
-    
-    free(buf);
+
     cJSON_Delete(root);
     free(msg);
+    return;
 }
 
 /* ==================== 二进制数据处理 ==================== */
@@ -567,9 +599,11 @@ static void ProcessHello(cJSON *root)
     if (cJSON_IsString(session_item) && session_item->valuestring != NULL &&
         session_item->valuestring[0] != '\0') {
         snprintf(g_session_id, sizeof(g_session_id), "%s", session_item->valuestring);
+        g_session_id_saved = 1;
         printf("[session] saved session_id=%s\n", g_session_id);
     } else {
         g_session_id[0] = '\0';
+        g_session_id_saved = 0;
         printf("[session] warning: hello response has no session_id\n");
     }
 
@@ -582,8 +616,9 @@ static void ProcessHello(cJSON *root)
     }
 
     if (client_wsi) {
-        StartListen(client_wsi);
+        StartListen(client_wsi, "after_hello");
     }
+    LogProtocolState("hello_processed");
 }
 
 /* ==================== MCP 消息处理 ==================== */
@@ -637,6 +672,11 @@ static void ProcessMCP(cJSON *root)
     } else if (strcmp(method->valuestring, "tools/list") == 0) {
         printf("[mcp] received tools/list request\n");
         SendMCPToolsListResult(id);
+    } else if (strcmp(method->valuestring, "notifications/initialized") == 0) {
+        g_mcp_initialized_notification_recv = 1;
+        printf("[mcp] received MCP notification: notifications/initialized\n");
+        printf("[mcp] no response required\n");
+        LogProtocolState("mcp_initialized_notification");
     } else if (id == NULL) {
         printf("[mcp] received MCP notification: %s\n", method->valuestring);
         printf("[mcp] no response required\n");
@@ -694,7 +734,7 @@ static void SendMCPInitializeResult(cJSON *request_id, const char *protocol_vers
     }
 
     printf("[mcp] queue initialize result: %s\n", msg);
-    if (ws_text_enqueue(msg, strlen(msg))) {
+    if (ws_text_enqueue_ex(msg, strlen(msg), WS_TEXT_KIND_MCP_INITIALIZE_RESULT, "mcp_initialize")) {
         request_ws_text_write();
     } else {
         printf("[mcp] error: failed to queue initialize result\n");
@@ -754,7 +794,7 @@ static void SendMCPToolsListResult(cJSON *request_id)
     }
 
     printf("[mcp] queue tools/list result: %s\n", msg);
-    if (ws_text_enqueue(msg, strlen(msg))) {
+    if (ws_text_enqueue_ex(msg, strlen(msg), WS_TEXT_KIND_MCP_TOOLS_LIST_RESULT, "mcp_tools_list")) {
         printf("[mcp] tools/list result queued for writeable callback\n");
         request_ws_text_write();
     } else {
@@ -776,7 +816,7 @@ static void ProcessTTS(cJSON *root)
         if (strcmp(state->valuestring, "stop") == 0 && !interrupted) {
             printf("🔄 TTS 播放结束，自动开始监听...\n");
             if (client_wsi) {
-                StartListen(client_wsi);
+                StartListen(client_wsi, "after_tts_stop");
             }
         }
     }
@@ -828,11 +868,20 @@ static int callback_echo(struct lws *wsi, enum lws_callback_reasons reason,
         client_wsi = wsi;
         hello_sent = 0;
         g_session_id[0] = '\0';
+        g_session_id_saved = 0;
+        g_listen_start_sent_count = 0;
+        g_listen_after_tools_list_sent = 0;
+        g_mcp_initialize_replied = 0;
+        g_mcp_initialized_notification_recv = 0;
+        g_mcp_tools_list_replied = 0;
+        LogProtocolState("ws_established");
         start_audio_thread();
         lws_callback_on_writable(wsi);
         break;
         
     case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+        printf("[ws] connection error: %s\n", in ? (char *)in : "unknown");
+        LogProtocolState("ws_connection_error");
         printf("❌ 连接错误：%s\n", in ? (char *)in : "未知错误");
         interrupted = 1;
         break;
@@ -877,7 +926,10 @@ static int callback_echo(struct lws *wsi, enum lws_callback_reasons reason,
 
         unsigned char text_out[LWS_PRE + WS_TEXT_MAX_SIZE];
         size_t text_len = 0;
-        if (ws_text_dequeue((char *)&text_out[LWS_PRE], &text_len)) {
+        ws_text_kind_t text_kind = WS_TEXT_KIND_GENERIC;
+        char text_reason[32] = {0};
+        if (ws_text_dequeue((char *)&text_out[LWS_PRE], &text_len,
+                            &text_kind, text_reason, sizeof(text_reason))) {
             int n = lws_write(wsi, &text_out[LWS_PRE], text_len, LWS_WRITE_TEXT);
             g_ws_text_sent_count++;
             printf("[ws-text] lws_write text returned %d/%zu sent_count=%lu\n",
@@ -886,6 +938,25 @@ static int callback_echo(struct lws *wsi, enum lws_callback_reasons reason,
                 fprintf(stderr, "[ws-text] lws_write text failed\n");
             } else if (n < (int)text_len) {
                 fprintf(stderr, "[ws-text] lws_write text incomplete: %d/%zu\n", n, text_len);
+            } else if (text_kind == WS_TEXT_KIND_LISTEN_START) {
+                g_listen_start_sent_count++;
+                if (strcmp(text_reason, "after_tools_list") == 0) {
+                    g_listen_after_tools_list_sent = 1;
+                }
+                printf("[listen] sent start reason=%s ret=%d/%zu\n",
+                       text_reason[0] != '\0' ? text_reason : "unknown", n, text_len);
+                LogProtocolState("listen_start_sent");
+            } else if (text_kind == WS_TEXT_KIND_MCP_INITIALIZE_RESULT) {
+                g_mcp_initialize_replied = 1;
+                printf("[mcp] initialize result sent ret=%d/%zu\n", n, text_len);
+                LogProtocolState("mcp_initialize_result_sent");
+            } else if (text_kind == WS_TEXT_KIND_MCP_TOOLS_LIST_RESULT) {
+                g_mcp_tools_list_replied = 1;
+                printf("[mcp] tools/list result sent ret=%d/%zu\n", n, text_len);
+                LogProtocolState("mcp_tools_list_result_sent");
+                if (g_session_id_saved && !g_listen_after_tools_list_sent) {
+                    StartListen(wsi, "after_tools_list");
+                }
             }
 
             if (ws_text_pending_count() > 0 || audio_tx_pending_count() > 0) {
@@ -919,6 +990,7 @@ static int callback_echo(struct lws *wsi, enum lws_callback_reasons reason,
         break;
     
     case LWS_CALLBACK_CLIENT_RECEIVE:
+        printf("[ws] receive %s len=%zu\n", lws_frame_is_binary(wsi) ? "binary" : "text", len);
         if (lws_frame_is_binary(wsi)) {
             ProcessBinDataFrmServer((unsigned char *)in, len);
         } else {
@@ -927,6 +999,8 @@ static int callback_echo(struct lws *wsi, enum lws_callback_reasons reason,
         break;
     
     case LWS_CALLBACK_CLIENT_CLOSED:
+        printf("[ws] client closed\n");
+        LogProtocolState("ws_closed");
         printf("🔒 连接关闭\n");
         stop_audio_thread();
         ws_text_clear();
@@ -934,6 +1008,11 @@ static int callback_echo(struct lws *wsi, enum lws_callback_reasons reason,
         interrupted = 1;
         break;
         
+    case LWS_CALLBACK_WSI_DESTROY:
+        printf("[ws] wsi destroy\n");
+        LogProtocolState("ws_wsi_destroy");
+        break;
+
     default:
         break;
     }
