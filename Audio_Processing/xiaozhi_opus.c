@@ -21,6 +21,9 @@
 #define FRAME_SIZE          (SAMPLE_RATE * FRAME_DURATION_MS / 1000)  /* 240 采样点 */
 #define MAX_PACKET_SIZE     8000
 #define ALSA_DEVICE         "hw:audiocodec"
+#define ALSA_DEVICE_ENV     "XIAOZHI_ALSA_DEVICE"
+#define ALSA_CAPTURE_DEVICE_ENV  "XIAOZHI_ALSA_CAPTURE_DEVICE"
+#define ALSA_PLAYBACK_DEVICE_ENV "XIAOZHI_ALSA_PLAYBACK_DEVICE"
 
 /* 预缓冲队列 */
 #define PRE_BUFFER_FRAMES   10        /* 修改：10 */
@@ -45,6 +48,8 @@ static pthread_t g_recv_thread;
 
 /* 采集相关 */
 static snd_pcm_t *g_alsa_handle = NULL;
+static const char *g_alsa_capture_device = ALSA_DEVICE;
+static const char *g_alsa_playback_device = ALSA_DEVICE;
 static volatile int g_running = 1;
 
 /* 统计信息 */
@@ -64,6 +69,8 @@ static int init_alsa_capture(void);
 static void cleanup_alsa(void);
 static int init_alsa_playback(void);
 static void cleanup_alsa_playback(void);
+static const char *getenv_nonempty(const char *name);
+static void configure_alsa_devices(void);
 static void *udp_recv_decode_play_thread(void *arg);
 static int audio_capture_and_encode(void);
 static void graceful_shutdown(void);
@@ -154,15 +161,42 @@ static void cleanup_opus_decoder(void)
 }
 
 /* ==================== ALSA 采集初始化 ==================== */
+static const char *getenv_nonempty(const char *name)
+{
+    const char *value = getenv(name);
+    return (value && value[0] != '\0') ? value : NULL;
+}
+
+static void configure_alsa_devices(void)
+{
+    const char *common_device = getenv_nonempty(ALSA_DEVICE_ENV);
+    const char *capture_device = getenv_nonempty(ALSA_CAPTURE_DEVICE_ENV);
+    const char *playback_device = getenv_nonempty(ALSA_PLAYBACK_DEVICE_ENV);
+
+    if (common_device) {
+        g_alsa_capture_device = common_device;
+        g_alsa_playback_device = common_device;
+    }
+    if (capture_device) {
+        g_alsa_capture_device = capture_device;
+    }
+    if (playback_device) {
+        g_alsa_playback_device = playback_device;
+    }
+
+    printf("ALSA capture device: %s\n", g_alsa_capture_device);
+    printf("ALSA playback device: %s\n", g_alsa_playback_device);
+}
+
 static int init_alsa_capture(void)
 {
     int err;
     snd_pcm_hw_params_t *hw_params;
     snd_pcm_sw_params_t *sw_params;
     
-    err = snd_pcm_open(&g_alsa_handle, ALSA_DEVICE, SND_PCM_STREAM_CAPTURE, 0);
+    err = snd_pcm_open(&g_alsa_handle, g_alsa_capture_device, SND_PCM_STREAM_CAPTURE, 0);
     if (err < 0) {
-        fprintf(stderr, "无法打开音频设备 %s: %s\n", ALSA_DEVICE, snd_strerror(err));
+        fprintf(stderr, "无法打开音频设备 %s: %s\n", g_alsa_capture_device, snd_strerror(err));
         return -1;
     }
     
@@ -281,9 +315,9 @@ static int init_alsa_playback(void)
     unsigned int rate = SAMPLE_RATE;
     unsigned int channels = CHANNELS;
     
-    err = snd_pcm_open(&g_alsa_play_handle, ALSA_DEVICE, SND_PCM_STREAM_PLAYBACK, 0);
+    err = snd_pcm_open(&g_alsa_play_handle, g_alsa_playback_device, SND_PCM_STREAM_PLAYBACK, 0);
     if (err < 0) {
-        fprintf(stderr, "无法打开播放设备：%s\n", snd_strerror(err));
+        fprintf(stderr, "无法打开播放设备 %s: %s\n", g_alsa_playback_device, snd_strerror(err));
         return -1;
     }
     
@@ -659,6 +693,8 @@ int main(int argc, char *argv[])
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGPIPE, SIG_IGN);
+
+    configure_alsa_devices();
     
     if (init_udp_socket() != 0 || init_udp_recv_socket() != 0) {
         return -1;
