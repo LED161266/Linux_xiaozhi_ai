@@ -643,18 +643,21 @@ static int audio_capture_and_encode(void)
     printf("\n[采集线程] 开始持续采集并编码，通过 UDP 发送...\n");
     
     /* 设置 ALSA 非阻塞模式 */
-    snd_pcm_nonblock(g_alsa_handle, 1);
+    /* Keep capture in blocking mode so ALSA provides natural audio pacing. */
     
     while (g_running) {
         int read_count = snd_pcm_readi(g_alsa_handle, pcm, FRAME_SIZE);
         
-        if (read_count < 0) {
+        if (read_count <= 0) {
             if (read_count == -EAGAIN || read_count == -EINTR) {
                 usleep(1000);
                 continue;
             }
             if (read_count == -EPIPE) {
                 snd_pcm_prepare(g_alsa_handle);
+                continue;
+            }
+            if (read_count == 0) {
                 continue;
             }
             break;
